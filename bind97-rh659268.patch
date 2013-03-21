@@ -1,0 +1,196 @@
+diff -up bind-9.7.0-P2/lib/dns/rbtdb.c.rh659268 bind-9.7.0-P2/lib/dns/rbtdb.c
+--- bind-9.7.0-P2/lib/dns/rbtdb.c.rh659268	2010-02-26 01:23:55.000000000 +0100
++++ bind-9.7.0-P2/lib/dns/rbtdb.c	2010-12-02 13:14:28.835307270 +0100
+@@ -5560,14 +5560,14 @@ add(dns_rbtdb_t *rbtdb, dns_rbtnode_t *r
+     dns_rdataset_t *addedrdataset, isc_stdtime_t now)
+ {
+ 	rbtdb_changed_t *changed = NULL;
+-	rdatasetheader_t *topheader, *topheader_prev, *header;
++	rdatasetheader_t *topheader, *topheader_prev, *header, *sigheader;
+ 	unsigned char *merged;
+ 	isc_result_t result;
+ 	isc_boolean_t header_nx;
+ 	isc_boolean_t newheader_nx;
+ 	isc_boolean_t merge;
+ 	dns_rdatatype_t rdtype, covers;
+-	rbtdb_rdatatype_t negtype;
++	rbtdb_rdatatype_t negtype, sigtype;
+ 	dns_trust_t trust;
+ 	int idx;
+ 
+@@ -5605,7 +5605,7 @@ add(dns_rbtdb_t *rbtdb, dns_rbtnode_t *r
+ 
+ 	newheader_nx = NONEXISTENT(newheader) ? ISC_TRUE : ISC_FALSE;
+ 	topheader_prev = NULL;
+-
++	sigheader = NULL;
+ 	negtype = 0;
+ 	if (rbtversion == NULL && !newheader_nx) {
+ 		rdtype = RBTDB_RDATATYPE_BASE(newheader->type);
+@@ -5614,26 +5614,34 @@ add(dns_rbtdb_t *rbtdb, dns_rbtnode_t *r
+ 			 * We're adding a negative cache entry.
+ 			 */
+ 			covers = RBTDB_RDATATYPE_EXT(newheader->type);
+-			if (covers == dns_rdatatype_any) {
++			sigtype = RBTDB_RDATATYPE_VALUE(dns_rdatatype_rrsig,
++							covers);
++			for (topheader = rbtnode->data;
++			     topheader != NULL;
++			     topheader = topheader->next) {
+ 				/*
+-				 * We're adding an negative cache entry
++				 * If we're adding an negative cache entry
+ 				 * which covers all types (NXDOMAIN,
+ 				 * NODATA(QTYPE=ANY)).
+ 				 *
+ 				 * We make all other data stale so that the
+ 				 * only rdataset that can be found at this
+ 				 * node is the negative cache entry.
++				 *
++				 * Otherwise look for any RRSIGs of the
++				 * given type so they can be marked stale
++				 * later.
+ 				 */
+-				for (topheader = rbtnode->data;
+-				     topheader != NULL;
+-				     topheader = topheader->next) {
++				if (covers == dns_rdatatype_any) {
+ 					set_ttl(rbtdb, topheader, 0);
+ 					topheader->attributes |=
+ 						RDATASET_ATTR_STALE;
+-				}
+-				rbtnode->dirty = 1;
+-				goto find_header;
++					rbtnode->dirty = 1;
++				}  else if (topheader->type == sigtype)
++					sigheader = topheader;
+ 			}
++			if (covers == dns_rdatatype_any)
++				goto find_header;
+ 			negtype = RBTDB_RDATATYPE_VALUE(covers, 0);
+ 		} else {
+ 			/*
+@@ -5872,6 +5880,11 @@ add(dns_rbtdb_t *rbtdb, dns_rbtnode_t *r
+ 			if (rbtversion == NULL) {
+ 				set_ttl(rbtdb, header, 0);
+ 				header->attributes |= RDATASET_ATTR_STALE;
++				if (sigheader != NULL) {
++					set_ttl(rbtdb, sigheader, 0);
++					sigheader->attributes |=
++						RDATASET_ATTR_STALE;
++				}
+ 			}
+ 			idx = newheader->node->locknum;
+ 			if (IS_CACHE(rbtdb)) {
+diff -up bind-9.7.0-P2/lib/dns/validator.c.rh659268 bind-9.7.0-P2/lib/dns/validator.c
+--- bind-9.7.0-P2/lib/dns/validator.c.rh659268	2010-12-02 13:14:28.831307131 +0100
++++ bind-9.7.0-P2/lib/dns/validator.c	2010-12-02 13:15:46.578011664 +0100
+@@ -387,6 +387,7 @@ fetch_callback_validator(isc_task_t *tas
+ 	isc_boolean_t want_destroy;
+ 	isc_result_t result;
+ 	isc_result_t eresult;
++	isc_result_t saved_result;
+ 
+ 	UNUSED(task);
+ 	INSIST(event->ev_type == DNS_EVENT_FETCHDONE);
+@@ -423,6 +424,17 @@ fetch_callback_validator(isc_task_t *tas
+ 				val->keyset = &val->frdataset;
+ 		}
+ 		result = validate(val, ISC_TRUE);
++		if (result == DNS_R_NOVALIDSIG &&
++		    (val->attributes & VALATTR_TRIEDVERIFY) == 0)
++		{
++			saved_result = result;
++			validator_log(val, ISC_LOG_DEBUG(3),
++				      "falling back to insecurity proof");
++			val->attributes |= VALATTR_INSECURITY;
++			result = proveunsecure(val, ISC_FALSE, ISC_FALSE);
++			if (result == DNS_R_NOTINSECURE)
++				result = saved_result;
++		}
+ 		if (result != DNS_R_WAIT)
+ 			validator_done(val, result);
+ 	} else {
+@@ -614,6 +626,7 @@ keyvalidated(isc_task_t *task, isc_event
+ 	isc_boolean_t want_destroy;
+ 	isc_result_t result;
+ 	isc_result_t eresult;
++	isc_result_t saved_result;
+ 
+ 	UNUSED(task);
+ 	INSIST(event->ev_type == DNS_EVENT_VALIDATORDONE);
+@@ -640,6 +653,17 @@ keyvalidated(isc_task_t *task, isc_event
+ 		if (val->frdataset.trust >= dns_trust_secure)
+ 			(void) get_dst_key(val, val->siginfo, &val->frdataset);
+ 		result = validate(val, ISC_TRUE);
++		if (result == DNS_R_NOVALIDSIG &&
++		    (val->attributes & VALATTR_TRIEDVERIFY) == 0)
++		{
++			saved_result = result;
++			validator_log(val, ISC_LOG_DEBUG(3),
++				      "falling back to insecurity proof");
++			val->attributes |= VALATTR_INSECURITY;
++			result = proveunsecure(val, ISC_FALSE, ISC_FALSE);
++			if (result == DNS_R_NOTINSECURE)
++				result = saved_result;
++		}
+ 		if (result != DNS_R_WAIT)
+ 			validator_done(val, result);
+ 	} else {
+@@ -1878,7 +1902,10 @@ validate(dns_validator_t *val, isc_boole
+ 		if (!dns_resolver_algorithm_supported(val->view->resolver,
+ 						      event->name,
+ 						      val->siginfo->algorithm))
++		{
++			resume = ISC_FALSE;
+ 			continue;
++		}
+ 
+ 		if (!resume) {
+ 			result = get_key(val, val->siginfo);
+@@ -1889,18 +1916,12 @@ validate(dns_validator_t *val, isc_boole
+ 		}
+ 
+ 		/*
+-		 * The key is insecure, so mark the data as insecure also.
++		 * There isn't a secure DNSKEY for this signature so move
++		 * onto the next RRSIG.
+ 		 */
+ 		if (val->key == NULL) {
+-			if (val->mustbesecure) {
+-				validator_log(val, ISC_LOG_WARNING,
+-					      "must be secure failure,"
+-					      " key is insecure, so mark the"
+-					      " data as insecure also.");
+-				return (DNS_R_MUSTBESECURE);
+-			}
+-			markanswer(val);
+-			return (ISC_R_SUCCESS);
++			resume = ISC_FALSE;
++			continue;
+ 		}
+ 
+ 		do {
+@@ -3606,6 +3627,22 @@ proveunsecure(dns_validator_t *val, isc_
+ 				 */
+ 				result = DNS_R_NOVALIDNSEC;
+ 				goto out;
++#define DNS_TRUST_ANSWER(x) ((x) == dns_trust_answer)
++			} else if (DNS_TRUST_PENDING(val->frdataset.trust) ||
++				   DNS_TRUST_ANSWER(val->frdataset.trust)) {
++#undef DNS_TRUST_ANSWER
++				/*
++				 * If we have "trust == answer" then this namespace
++				 * has switched from insecure to should be secure.
++				 */
++				result = create_validator(val, tname,
++							  dns_rdatatype_ds,
++							  &val->frdataset,
++							  NULL, dsvalidated,
++							  "proveunsecure");
++				if (result != ISC_R_SUCCESS)
++					goto out;
++				return (DNS_R_WAIT);
+ 			} else if (val->frdataset.trust < dns_trust_secure) {
+ 				/*
+ 				 * This shouldn't happen, since the negative
